@@ -1,0 +1,286 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Chiptune SFX NES-Style Composer</title>
+<script src="https://cdn.tailwindcss.com"></script>
+<style>
+  body { background: #1a0a2e; color: #e0d0ff; font-family: 'Courier New', monospace; }
+  .cell { width: 32px; height: 32px; border: 1px solid #4a3a6e; cursor: pointer; transition: background 0.1s; }
+  .cell.active { background: #a855f7; }
+  .cell.playing { outline: 2px solid #fbbf24; }
+  .cell:hover { background: #7c3aed; }
+  .knob-wrap { display: flex; flex-direction: column; align-items: center; gap: 4px; }
+  .channel-header { background: #2d1b4e; border-radius: 6px; padding: 8px 12px; }
+  input[type=range] { accent-color: #a855f7; }
+  .btn { background: #4c1d95; color: #e0d0ff; border: 1px solid #7c3aed; border-radius: 4px; padding: 6px 14px; cursor: pointer; transition: background 0.1s; font-family: 'Courier New', monospace; }
+  .btn:hover { background: #6d28d9; }
+  .btn.active { background: #7c3aed; }
+  .preset-btn { background: #1e3a5f; border: 1px solid #3b82f6; }
+  .preset-btn:hover { background: #1d4ed8; }
+  select { background: #2d1b4e; color: #e0d0ff; border: 1px solid #7c3aed; border-radius: 4px; padding: 4px 8px; font-family: 'Courier New', monospace; }
+  .pitch-label { font-size: 11px; color: #9d8dc0; width: 28px; text-align: right; padding-right: 4px; }
+</style>
+</head>
+<body class="min-h-screen p-4">
+<div class="max-w-5xl mx-auto">
+  <h1 class="text-2xl font-bold text-purple-300 mb-1">NES Chiptune Composer</h1>
+  <p class="text-purple-500 text-sm mb-4">4-channel retro sound synthesizer</p>
+
+  <!-- Transport Controls -->
+  <div class="flex items-center gap-4 mb-4 bg-purple-950 p-3 rounded-lg border border-purple-800">
+    <button id="playBtn" class="btn text-lg px-6" aria-label="Play or Stop">▶ PLAY</button>
+    <div class="flex items-center gap-2">
+      <label for="bpmSlider" class="text-purple-300 text-sm">BPM:</label>
+      <input type="range" id="bpmSlider" min="60" max="200" value="120" class="w-28" aria-label="BPM">
+      <span id="bpmVal" class="text-purple-300 w-8">120</span>
+    </div>
+    <div class="ml-auto flex gap-2">
+      <button class="btn preset-btn" onclick="loadPreset('jump')" aria-label="Load jump preset">Jump</button>
+      <button class="btn preset-btn" onclick="loadPreset('coin')" aria-label="Load coin preset">Coin</button>
+      <button class="btn preset-btn" onclick="loadPreset('explosion')" aria-label="Load explosion preset">Boom</button>
+      <button class="btn" onclick="clearAll()" aria-label="Clear all">Clear</button>
+    </div>
+  </div>
+
+  <!-- Channels -->
+  <div class="space-y-3" id="channelContainer"></div>
+</div>
+
+<script>
+const PITCHES = ['C5','B4','A4','G4','F4','E4','D4','C4'];
+const FREQS = { C5:523.25, B4:493.88, A4:440, G4:392, F4:349.23, E4:329.63, D4:293.66, C4:261.63 };
+const STEPS = 16;
+const CHANNELS = [
+  { id:'pulse1', name:'Pulse 1', type:'square', duty:0.5, color:'#a855f7' },
+  { id:'pulse2', name:'Pulse 2', type:'square', duty:0.25, color:'#ec4899' },
+  { id:'triangle', name:'Triangle', type:'triangle', color:'#22d3ee' },
+  { id:'noise', name:'Noise', type:'noise', color:'#f97316' },
+];
+
+let audioCtx = null;
+let playing = false;
+let currentStep = 0;
+let stepInterval = null;
+let grids = {};
+let volumes = {};
+let duties = {};
+
+function getAudioCtx() {
+  if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+  return audioCtx;
+}
+
+// Initialize state
+CHANNELS.forEach(ch => {
+  grids[ch.id] = Array.from({length: STEPS}, () => Array(PITCHES.length).fill(false));
+  volumes[ch.id] = 0.5;
+  duties[ch.id] = ch.duty || 0.5;
+});
+
+function buildUI() {
+  const container = document.getElementById('channelContainer');
+  CHANNELS.forEach(ch => {
+    const div = document.createElement('div');
+    div.className = 'channel-header';
+    div.innerHTML = `
+      <div class="flex items-center gap-3 mb-2">
+        <span class="font-bold text-sm" style="color:${ch.color};width:70px">${ch.name}</span>
+        <div class="flex items-center gap-2">
+          <label for="vol_${ch.id}" class="text-purple-400 text-xs">VOL</label>
+          <input type="range" id="vol_${ch.id}" min="0" max="1" step="0.05" value="0.5" class="w-20" aria-label="${ch.name} volume">
+        </div>
+        ${ch.type === 'square' ? `
+        <div class="flex items-center gap-2">
+          <label for="duty_${ch.id}" class="text-purple-400 text-xs">DUTY</label>
+          <select id="duty_${ch.id}" aria-label="${ch.name} duty cycle">
+            <option value="0.125">12.5%</option>
+            <option value="0.25">25%</option>
+            <option value="0.5" selected>50%</option>
+          </select>
+        </div>` : ''}
+      </div>
+      <div class="flex items-center" id="grid_${ch.id}"></div>
+    `;
+    container.appendChild(div);
+
+    // Volume listener
+    document.getElementById(`vol_${ch.id}`).addEventListener('input', e => {
+      volumes[ch.id] = parseFloat(e.target.value);
+    });
+    if (ch.type === 'square') {
+      document.getElementById(`duty_${ch.id}`).addEventListener('change', e => {
+        duties[ch.id] = parseFloat(e.target.value);
+      });
+    }
+
+    // Build grid
+    const gridEl = document.getElementById(`grid_${ch.id}`);
+    PITCHES.forEach((pitch, pi) => {
+      const row = document.createElement('div');
+      row.style.display = 'flex';
+      const label = document.createElement('div');
+      label.className = 'pitch-label';
+      label.textContent = ch.type === 'noise' ? (pi === 0 ? 'HI' : pi === 7 ? 'LO' : '') : pitch;
+      row.appendChild(label);
+      for (let s = 0; s < STEPS; s++) {
+        const cell = document.createElement('div');
+        cell.className = 'cell';
+        cell.setAttribute('role', 'checkbox');
+        cell.setAttribute('aria-label', `${ch.name} step ${s+1} ${pitch}`);
+        cell.setAttribute('aria-checked', 'false');
+        cell.dataset.ch = ch.id;
+        cell.dataset.step = s;
+        cell.dataset.pitch = pi;
+        cell.addEventListener('click', () => toggleCell(ch.id, s, pi, cell));
+        row.appendChild(cell);
+      }
+      gridEl.appendChild(row);
+    });
+  });
+}
+
+function toggleCell(chId, step, pitch, el) {
+  grids[chId][step][pitch] = !grids[chId][step][pitch];
+  el.classList.toggle('active', grids[chId][step][pitch]);
+  el.setAttribute('aria-checked', grids[chId][step][pitch]);
+}
+
+function playNote(ch, pitchIdx, vol) {
+  const ctx = getAudioCtx();
+  const now = ctx.currentTime;
+  const stepDur = 60 / (parseInt(document.getElementById('bpmSlider').value) * 4);
+
+  if (ch.type === 'noise') {
+    const bufSize = ctx.sampleRate * stepDur;
+    const buf = ctx.createBuffer(1, bufSize, ctx.sampleRate);
+    const data = buf.getChannelData(0);
+    const freq = 1 - (pitchIdx / PITCHES.length) * 0.8;
+    for (let i = 0; i < bufSize; i++) data[i] = (Math.random() * 2 - 1) * freq;
+    const src = ctx.createBufferSource();
+    src.buffer = buf;
+    const gain = ctx.createGain();
+    gain.gain.setValueAtTime(vol * 0.5, now);
+    gain.gain.exponentialRampToValueAtTime(0.001, now + stepDur * 0.8);
+    src.connect(gain); gain.connect(ctx.destination);
+    src.start(now); src.stop(now + stepDur);
+    return;
+  }
+
+  const freq = ch.type === 'triangle' ? FREQS[PITCHES[pitchIdx]] : FREQS[PITCHES[pitchIdx]];
+  if (ch.type === 'square') {
+    // Approximate square wave with harmonics
+    const duty = duties[ch.id];
+    const osc = ctx.createOscillator();
+    osc.type = 'square';
+    osc.frequency.value = freq;
+    const gain = ctx.createGain();
+    gain.gain.setValueAtTime(vol * 0.3, now);
+    gain.gain.exponentialRampToValueAtTime(0.001, now + stepDur * 0.9);
+    osc.connect(gain); gain.connect(ctx.destination);
+    osc.start(now); osc.stop(now + stepDur);
+  } else {
+    const osc = ctx.createOscillator();
+    osc.type = 'triangle';
+    osc.frequency.value = freq;
+    const gain = ctx.createGain();
+    gain.gain.setValueAtTime(vol * 0.4, now);
+    gain.gain.exponentialRampToValueAtTime(0.001, now + stepDur * 0.95);
+    osc.connect(gain); gain.connect(ctx.destination);
+    osc.start(now); osc.stop(now + stepDur);
+  }
+}
+
+function tick() {
+  // Clear previous step highlights
+  document.querySelectorAll('.cell.playing').forEach(c => c.classList.remove('playing'));
+
+  CHANNELS.forEach(ch => {
+    for (let pi = 0; pi < PITCHES.length; pi++) {
+      if (grids[ch.id][currentStep][pi]) {
+        playNote(ch, pi, volumes[ch.id]);
+        // highlight
+        const cells = document.querySelectorAll(`[data-ch="${ch.id}"][data-step="${currentStep}"][data-pitch="${pi}"]`);
+        cells.forEach(c => c.classList.add('playing'));
+      }
+    }
+    // Highlight current column
+    document.querySelectorAll(`[data-ch="${ch.id}"][data-step="${currentStep}"]`).forEach(c => {
+      if (!grids[ch.id][currentStep][parseInt(c.dataset.pitch)]) c.classList.add('playing');
+    });
+  });
+
+  currentStep = (currentStep + 1) % STEPS;
+}
+
+document.getElementById('playBtn').addEventListener('click', () => {
+  getAudioCtx().resume();
+  playing = !playing;
+  const btn = document.getElementById('playBtn');
+  if (playing) {
+    currentStep = 0;
+    const bpm = parseInt(document.getElementById('bpmSlider').value);
+    const ms = (60000 / bpm) / 4;
+    stepInterval = setInterval(tick, ms);
+    btn.textContent = '■ STOP';
+    btn.classList.add('active');
+  } else {
+    clearInterval(stepInterval);
+    document.querySelectorAll('.cell.playing').forEach(c => c.classList.remove('playing'));
+    btn.textContent = '▶ PLAY';
+    btn.classList.remove('active');
+  }
+});
+
+document.getElementById('bpmSlider').addEventListener('input', e => {
+  document.getElementById('bpmVal').textContent = e.target.value;
+  if (playing) {
+    clearInterval(stepInterval);
+    const ms = (60000 / parseInt(e.target.value)) / 4;
+    stepInterval = setInterval(tick, ms);
+  }
+});
+
+function setCell(chId, step, pitch, val) {
+  grids[chId][step][pitch] = val;
+  const el = document.querySelector(`[data-ch="${chId}"][data-step="${step}"][data-pitch="${pitch}"]`);
+  if (el) { el.classList.toggle('active', val); el.setAttribute('aria-checked', val); }
+}
+
+function clearAll() {
+  CHANNELS.forEach(ch => {
+    for (let s = 0; s < STEPS; s++)
+      for (let p = 0; p < PITCHES.length; p++) setCell(ch.id, s, p, false);
+  });
+}
+
+const PRESETS = {
+  jump: () => {
+    clearAll();
+    // Pulse 1: ascending arpeggio
+    [[0,7],[1,5],[2,3],[3,1],[4,0]].forEach(([s,p]) => setCell('pulse1', s, p, true));
+    // Triangle bass
+    [[0,7],[2,5]].forEach(([s,p]) => setCell('triangle', s, p, true));
+  },
+  coin: () => {
+    clearAll();
+    // High pitch pulse
+    [[0,1],[1,0],[0,0]].forEach(([s,p]) => setCell('pulse1', s, p, true));
+    [[2,1],[3,0]].forEach(([s,p]) => setCell('pulse2', s, p, true));
+  },
+  explosion: () => {
+    clearAll();
+    // Noise burst
+    for (let s = 0; s < 8; s++) setCell('noise', s, 7, true);
+    for (let s = 0; s < 4; s++) setCell('noise', s, 6, true);
+    [[0,7],[1,7],[2,6]].forEach(([s,p]) => setCell('triangle', s, p, true));
+  }
+};
+
+function loadPreset(name) { PRESETS[name](); }
+
+buildUI();
+</script>
+</body>
+</html>
